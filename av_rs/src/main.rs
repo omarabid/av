@@ -20,7 +20,8 @@ use config::user_state::{load_user_state, UserState};
 use git_ops::AvRepo;
 use crate::commands::branch::BranchOpts;
 use crate::commands::stack::StackOpts;
-use crate::commands::pr::PrOpts; // Added for Pr command
+use crate::commands::pr::PrOpts;
+use crate::commands::commit::CommitOpts; // Added for Commit command
 
 // Global static variables, initialized in main
 pub static GLOBAL_CONFIG: OnceCell<AvConfig> = OnceCell::new();
@@ -53,6 +54,8 @@ enum Commands {
     Stack(StackOpts),
     #[clap(about = "Manage pull requests")]
     Pr(PrOpts),
+    #[clap(about = "Record changes and update av metadata")]
+    Commit(CommitOpts),
     #[clap(about = "Print the version information")]
     Version {},
     #[clap(about = "Initialize the repository for Aviator CLI")]
@@ -125,8 +128,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stack(stack_opts) => { // Correctly use stack_opts
             commands::stack::run_stack_cmd(stack_opts).await?
         }
-        Commands::Pr(pr_opts) => { // Add Pr command handling
+        Commands::Pr(pr_opts) => {
             commands::pr::run_pr_cmd(pr_opts).await?
+        }
+        Commands::Commit(commit_opts) => { // Add Commit command handling
+            commands::commit::run_commit_cmd(commit_opts).await?
         }
         Commands::Version {} => {
             println!("{}", env!("CARGO_PKG_VERSION"));
