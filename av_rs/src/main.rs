@@ -9,6 +9,7 @@ use std::path::PathBuf;
 // Modules
 mod commands;
 pub mod config;
+pub mod gh;
 
 // Bring config types and functions into scope
 use config::{load_config, AvConfig};
