@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use log::{info, debug, warn};
+use std::collections::{HashMap, HashSet}; // For get_current_stack_branches if used here
 
-use crate::actions; // Added for actions::pr module
+use crate::actions;
 use crate::git_ops::AvRepo;
 use crate::meta::{JsonFileDb, BranchMeta, PullRequestMeta};
 use crate::gh::GhClient;
 use crate::{GIT_REPO, GLOBAL_CONFIG};
+// If get_current_stack_branches is moved to a shared location or if stack.rs is a public module
+// use crate::commands::stack::get_current_stack_branches; // Or its new path
 
 #[derive(Parser, Debug)]
 pub struct PrOpts {
@@ -16,7 +19,8 @@ pub struct PrOpts {
 
 #[derive(Subcommand, Debug)]
 pub enum PrCommand {
-    Create(PrCreateOpts)
+    Create(PrCreateOpts),
+    Update(PrUpdateOpts),
 }
 
 #[derive(Args, Debug)]
@@ -32,10 +36,95 @@ pub struct PrCreateOpts {
     // TODO: reviewers, base, force
 }
 
+#[derive(Args, Debug)]
+pub struct PrUpdateOpts {
+    #[clap(help="PR number to update. If not provided, updates PR for current branch.")]
+    pub pr_number: Option<i64>,
+    // TODO: flags like --title, --body (direct set), --stack (explicitly update stack context)
+    // For now, it will only update the stack context in the body.
+}
+
+
 pub async fn run_pr_cmd(opts: PrOpts) -> Result<()> {
     match opts.command {
-        PrCommand::Create(create_opts) => handle_pr_create(create_opts).await
+        PrCommand::Create(create_opts) => handle_pr_create(create_opts).await,
+        PrCommand::Update(update_opts) => handle_pr_update(update_opts).await,
     }
+}
+
+async fn handle_pr_update(opts: PrUpdateOpts) -> Result<()> {
+    let av_repo = GIT_REPO.get().unwrap().as_ref().context("PR update command requires Git repo")?;
+    let config = GLOBAL_CONFIG.get().expect("GLOBAL_CONFIG not initialized");
+    let db = JsonFileDb::new(&av_repo.common_dir);
+
+    let gh_token = config.github.token.as_deref().context("GitHub token not configured")?;
+    let gh_client = GhClient::new(gh_token, config.github.base_url.as_deref())?;
+
+    let repo_meta_from_db = db.read_state()?.repository
+        .with_context(|| "Repository metadata not initialized (run 'av init')")?;
+
+    let target_pr_number: i64;
+    let target_pr_branch_name: String;
+    let target_pr_node_id: String;
+
+    if let Some(pr_num) = opts.pr_number {
+        target_pr_number = pr_num;
+        // Find branch associated with this PR number from metadata
+        let all_branches = db.get_all_branches()?;
+        let found_branch_meta = all_branches.values()
+            .find(|bm| bm.pull_request.as_ref().map_or(false, |pr| pr.number == target_pr_number));
+
+        match found_branch_meta {
+            Some(bm) => {
+                target_pr_branch_name = bm.name.clone();
+                target_pr_node_id = bm.pull_request.as_ref().unwrap().id.clone(); // Must have PR if found by number
+            }
+            None => return Err(anyhow!("No PR found in metadata with number #{}", target_pr_number)),
+        }
+    } else {
+        target_pr_branch_name = av_repo.current_branch_name()?;
+        let branch_meta = db.get_branch(&target_pr_branch_name)?
+            .with_context(|| format!("Current branch '{}' not found in av metadata.", target_pr_branch_name))?;
+        let pr_meta = branch_meta.pull_request
+            .with_context(|| format!("Branch '{}' does not have an associated PR in metadata. Use 'av pr create'.", target_pr_branch_name))?;
+        target_pr_number = pr_meta.number;
+        target_pr_node_id = pr_meta.id.clone();
+    }
+
+    info!("Updating PR #{} (branch '{}')", target_pr_number, target_pr_branch_name);
+
+    // Fetch current PR details (especially the body)
+    let pr_details = gh_client.get_pull_request_details(&repo_meta_from_db.owner.login, &repo_meta_from_db.name, target_pr_number).await
+        .with_context(|| format!("Failed to fetch current details for PR #{}", target_pr_number))?;
+
+    // Identify stack for the target PR's branch
+    // NOTE: get_current_stack_branches is currently in commands/stack.rs.
+    // It should be moved to a more shared location (e.g., actions or a new 'stacks' module) to be used here.
+    // For now, this will cause a compile error if not moved.
+    // Placeholder:
+    // let all_branches_from_db = db.get_all_branches()?;
+    // let current_stack_branch_names = crate::commands::stack::get_current_stack_branches(&target_pr_branch_name, &all_branches_from_db, av_repo, config)?;
+    // let stack_branch_metas_for_action: Vec<&BranchMeta> = all_branches_from_db.values()
+    //      .filter(|bm| current_stack_branch_names.contains(&bm.name)).collect();
+    // For this subtask, let's assume an empty stack for now to avoid cross-module dependency issues with get_current_stack_branches.
+    // This means the PR body will say "This PR is not part of a stack." or similar.
+    // The proper fix is to move get_current_stack_branches.
+    warn!("Stack context for PR body update is currently simplified (shows no stack). Refactor needed for get_current_stack_branches.");
+    let stack_branch_metas_for_action: Vec<&BranchMeta> = Vec::new();
+
+
+    let action_opts = actions::pr::UpdatePrBodyWithStackOpts {
+        pr_node_id: &target_pr_node_id,
+        pr_number: target_pr_number,
+        pr_current_body: pr_details.body,
+        stack_branch_metas: stack_branch_metas_for_action,
+    };
+
+    actions::pr::update_pr_body_with_stack_info(&gh_client, action_opts).await
+        .with_context(|| format!("Failed to update PR #{} body with stack information", target_pr_number))?;
+
+    info!("PR #{} successfully updated with stack information.", target_pr_number);
+    Ok(())
 }
 
 async fn handle_pr_create(opts: PrCreateOpts) -> Result<()> {

@@ -45,3 +45,12 @@ pub struct PrStatusInfo {
     pub head_ref_name: String,
     pub base_ref_name: String,
 }
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestDetails {
+    pub id: String,
+    pub body: Option<String>, // Body can be null
+    // pub title: String, // Not fetching title in this specific struct for now, can be added
+    // pub base_ref_name: Option<String>, // Also can be added if needed
+}
