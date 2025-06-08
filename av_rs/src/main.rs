@@ -16,8 +16,9 @@ pub mod meta;
 
 // Bring config types and functions into scope
 use config::{load_config, AvConfig};
-use config::user_state::{load_user_state, UserState}; // save_user_state will be used by commands
+use config::user_state::{load_user_state, UserState};
 use git_ops::AvRepo;
+use crate::commands::branch::BranchOpts; // Added for Commands enum
 
 // Global static variables, initialized in main
 pub static GLOBAL_CONFIG: OnceCell<AvConfig> = OnceCell::new();
@@ -44,8 +45,8 @@ enum Commands {
     Adopt {},
     #[clap(about = "Authenticate with GitHub")]
     Auth {},
-    #[clap(about = "Manage branches")]
-    Branch {},
+    #[clap(about = "Manage stacked branches")]
+    Branch(BranchOpts),
     #[clap(about = "Print the version information")]
     Version {},
     #[clap(about = "Initialize the repository for Aviator CLI")]
@@ -110,14 +111,17 @@ async fn main() -> anyhow::Result<()> {
             // TODO: Implement auth command logic
         }
         Commands::Branch {} => {
-            info!("[COMMAND] Branch");
+            // This was a placeholder, now replaced by actual command handling
+            // info!("[COMMAND] Branch");
             // TODO: Implement branch command logic
+            commands::branch::run_branch_cmd(opts).await?
         }
         Commands::Version {} => {
             println!("{}", env!("CARGO_PKG_VERSION"));
         }
         Commands::Init {} => {
-            commands::init::run(cli.directory).await?
+            // Pass None for directory as AvRepo is now globally discovered if possible
+            commands::init::run(None).await?
         }
     }
 

@@ -31,3 +31,25 @@ pub struct MetadataState {
     pub repository: Option<RepositoryMeta>,
     pub branches: HashMap<String, BranchMeta>,
 }
+
+impl MetadataState {
+    pub fn branch(&self, name: &str) -> Option<&BranchMeta> {
+        self.branches.get(name)
+    }
+
+    pub fn upsert_branch(&mut self, branch_meta: BranchMeta) {
+        self.branches.insert(branch_meta.name.clone(), branch_meta);
+    }
+
+    pub fn delete_branch(&mut self, name: &str) -> Option<BranchMeta> {
+        self.branches.remove(name)
+    }
+
+    pub fn repository(&self) -> Option<&RepositoryMeta> {
+        self.repository.as_ref()
+    }
+
+    pub fn set_repository(&mut self, repo_meta: RepositoryMeta) {
+        self.repository = Some(repo_meta);
+    }
+}
