@@ -13,6 +13,7 @@ pub mod config;
 pub mod gh;
 pub mod git_ops;
 pub mod meta;
+pub mod actions;
 
 // Bring config types and functions into scope
 use config::{load_config, AvConfig};

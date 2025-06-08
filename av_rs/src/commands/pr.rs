@@ -2,8 +2,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use log::{info, debug, warn};
 
+use crate::actions; // Added for actions::pr module
 use crate::git_ops::AvRepo;
-use crate::meta::{JsonFileDb, BranchMeta, PullRequestMeta}; // PullRequestMeta from meta::types
+use crate::meta::{JsonFileDb, BranchMeta, PullRequestMeta};
 use crate::gh::GhClient;
 use crate::{GIT_REPO, GLOBAL_CONFIG};
 
@@ -84,45 +85,39 @@ async fn handle_pr_create(opts: PrCreateOpts) -> Result<()> {
     };
     debug!("Determined PR title: {}", title);
 
-    let body = opts.body.unwrap_or_default(); // Simple body for now
+    let body = opts.body.unwrap_or_default();
 
-    if !opts.no_push {
-        info!("Pushing branch '{}' to remote '{}'...", current_branch_name, default_remote);
-        let refspec = format!("refs/heads/{}:refs/heads/{}", current_branch_name, current_branch_name);
-        av_repo.push(default_remote, &[&refspec], false).context("Failed to push branch")?; // false for no force push
-        info!("Branch pushed successfully.");
-    } else {
-        info!("Skipping push due to --no-push flag.");
+    let repo_meta_state = db.read_state()?.repository
+        .with_context(|| "Repository metadata not initialized. Please run `av init` to fetch repository details.")?;
+
+    let action_opts = actions::pr::CreatePullRequestOpts {
+        repo_owner: &repo_meta_state.owner.login, // Corrected: access login field
+        repo_name: &repo_meta_state.name,
+        repo_node_id: &repo_meta_state.id,
+        head_ref_name: &current_branch_name,
+        base_ref_name: parent_branch_name, // This is &str from as_deref
+        title, // Already a String
+        body,  // Already a String
+        is_draft: opts.draft,
+        no_push: opts.no_push,
+        default_remote_name: default_remote,
+    };
+
+    match actions::pr::create_pull_request(av_repo, &gh_client, &db, action_opts).await {
+        Ok(created_pr) => {
+            info!("Successfully created PR #{} for branch '{}' via action: {}", created_pr.number, current_branch_name, created_pr.permalink);
+            // TODO: Potentially open browser here if desired by config/flags
+        }
+        Err(e) => {
+            return Err(e.context(format!("Failed to create PR for branch '{}'", current_branch_name)));
+        }
     }
 
-    let repo_meta = db.read_state()?.repository.context("Repository metadata not initialized (run 'av init' first to fetch repository Node ID)")?;
+    // Note: Metadata update is now handled by the `actions::pr::create_pull_request` function.
+    // The old direct metadata update code is removed from here.
 
-    info!("Creating PR on GitHub: head='{}', base='{}', title='{}', draft={}", current_branch_name, parent_branch_name, title, opts.draft);
-    let pr_node = gh_client.create_pull_request(
-        &repo_meta.id, // GitHub Node ID for the repository
-        parent_branch_name,
-        // For head_ref_name, GitHub typically expects just the branch name.
-        // If your remote is 'origin', head_ref_name "my-feature" becomes "refs/heads/my-feature" locally,
-        // and GitHub figures out "owner:my-feature" or similar.
-        &current_branch_name,
-        &title,
-        &body,
-        opts.draft
-    ).await.context("Failed to create pull request on GitHub")?;
-
-    info!("Successfully created PR #{}: {}", pr_node.number, pr_node.permalink);
-
-    // Update metadata
-    branch_meta.pull_request = Some(PullRequestMeta {
-        id: pr_node.id,
-        number: pr_node.number,
-        permalink: pr_node.permalink,
-    });
-    db.upsert_branch(&branch_meta).context("Failed to update branch metadata with PR info")?;
-    info!("Branch metadata updated with PR information.");
-
-    // TODO: Add reviewers
-    // TODO: Update PR body with stack info (e.g. list of other PRs in the stack)
+    // TODO: Add reviewers (could be another action or part of CreatePullRequestOpts)
+    // TODO: Update PR body with stack info (e.g. list of other PRs in the stack) - likely another action
 
     Ok(())
 }

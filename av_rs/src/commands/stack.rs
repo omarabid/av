@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque}; // Added VecDeque for BFS/to
 
 use crate::gh::GhClient;
 use crate::git_ops::AvRepo;
-use crate::meta::{BranchMeta, JsonFileDb, PullRequestMeta}; // Added PullRequestMeta
-use crate::{GIT_REPO, GLOBAL_CONFIG};
-use log::error; // For logging errors in submit
+use crate::meta::{BranchMeta, JsonFileDb, PullRequestMeta};
+use crate::{GIT_REPO, GLOBAL_CONFIG, actions}; // Added actions module
+use log::error;
 
 #[derive(Parser, Debug)]
 pub struct StackOpts {
@@ -226,38 +226,32 @@ async fn handle_stack_submit(opts: StackSubmitOpts) -> Result<()> {
         };
         let body = format!("PR for branch {}.", branch_meta.name); // Simple body for now
 
-        info!("Pushing branch '{}' to remote '{}'...", branch_meta.name, default_remote);
-        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_meta.name, branch_meta.name);
-        if let Err(e) = av_repo.push(default_remote, &[&refspec], false) { // false for no force push here
-            pr_creation_errors.push(format!("Failed to push branch '{}': {}", branch_meta.name, e));
-            error!("Failed to push branch '{}': {}. Skipping PR creation.", branch_meta.name, e);
-            continue;
-        }
+        // Construct CreatePullRequestOpts for the action
+        let action_opts = actions::pr::CreatePullRequestOpts {
+            repo_owner: &repo_info_for_gh.owner.login,
+            repo_name: &repo_info_for_gh.name,
+            repo_node_id: &repo_info_for_gh.id,
+            head_ref_name: &branch_meta.name,
+            base_ref_name: &parent_branch_name_for_pr,
+            title: title.clone(), // title is String, action_opts takes String
+            body: body.clone(),   // body is String, action_opts takes String
+            is_draft: opts.draft,
+            no_push: false, // stack submit implies push for now; add flag to StackSubmitOpts if needed
+            default_remote_name: default_remote,
+        };
 
-        info!("Creating PR for branch '{}': base='{}', title='{}', draft={}", branch_meta.name, parent_branch_name_for_pr, title, opts.draft);
-        match gh_client.create_pull_request(
-            &repo_info_for_gh.id,
-            &parent_branch_name_for_pr,
-            &branch_meta.name,
-            &title,
-            &body,
-            opts.draft
-        ).await {
-            Ok(pr_node) => {
-                info!("Successfully created PR #{} for branch '{}': {}", pr_node.number, branch_meta.name, pr_node.permalink);
-                branch_meta.pull_request = Some(PullRequestMeta { // Use crate::meta::PullRequestMeta
-                    id: pr_node.id, number: pr_node.number, permalink: pr_node.permalink,
-                });
-                if let Err(e) = db.upsert_branch(&branch_meta) {
-                    let err_msg = format!("Failed to update metadata for branch '{}' after PR creation: {}", branch_meta.name, e);
-                    error!("{}", err_msg);
-                    pr_creation_errors.push(err_msg);
+        match actions::pr::create_pull_request(av_repo, &gh_client, &db, action_opts).await {
+            Ok(created_pr_meta) => {
+                // The action already updates the DB, but we need to update our in-memory map
+                // if other iterations depend on this PR info (e.g., for complex body generation - not currently).
+                if let Some(meta_in_map) = all_branches_meta_map.get_mut(&branch_meta.name) {
+                    meta_in_map.pull_request = Some(created_pr_meta);
                 }
-                // Update the map for subsequent parent/child processing if needed (though submit doesn't have inter-branch dependencies like sync rebase)
-                all_branches_meta_map.insert(branch_meta.name.clone(), branch_meta.clone());
+                // Log success (already done by the action, but can add a specific one for submit context)
+                // info!("PR for branch '{}' created/updated successfully via action.", branch_meta.name);
             }
             Err(e) => {
-                let err_msg = format!("Failed to create PR for branch '{}': {}", branch_meta.name, e);
+                let err_msg = format!("Failed to create PR for branch '{}' via action: {}", branch_meta.name, e);
                 error!("{}", err_msg);
                 pr_creation_errors.push(err_msg);
             }
