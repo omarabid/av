@@ -73,7 +73,9 @@ async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
         info!("Fetch complete.");
     }
 
-    let mut all_branches_meta_mut = db.get_all_branches() // Make it mutable for updates
+    let initial_branch_name = av_repo.current_branch_name().ok(); // Store initially checked-out branch
+
+    let mut all_branches_meta_mut = db.get_all_branches()
         .context("Failed to load branch metadata for sync")?;
 
     if all_branches_meta_mut.is_empty() {
@@ -81,60 +83,74 @@ async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
         return Ok(());
     }
 
-    // Determine the order for syncing branches (parents before children)
-    // TODO: If opts.current_stack, filter roots and all_branches_meta_mut accordingly before this.
     let branches_to_sync_ordered = get_branches_in_sync_order(&all_branches_meta_mut);
-
     info!("Processing {} branches for sync...", branches_to_sync_ordered.len());
 
     for branch_to_sync_ref in branches_to_sync_ordered {
-        // Clone to allow modification and later update in all_branches_meta_mut for subsequent parent checks.
-        let mut branch_to_sync_meta = branch_to_sync_ref.clone();
+        let mut branch_to_sync_meta = branch_to_sync_ref.clone(); // Operate on a clone
         let branch_name = &branch_to_sync_meta.name;
         let mut was_rebased = false;
-        let mut statuses = Vec::new(); // For collecting status messages for this branch
+        let mut statuses = Vec::new();
 
         info!("Synchronizing branch: {}", branch_name);
 
-        // **Rebase Logic (if opts.rebase)**
         if opts.rebase {
             if let Some(parent_branch_name) = &branch_to_sync_meta.parent_branch {
-                // Get parent's *current* head from Git (could be from metadata of already synced parent, or directly from Git)
-                let actual_parent_head_oid_str =
-                    if let Some(synced_parent_meta) = all_branches_meta_mut.get(parent_branch_name) {
-                        synced_parent_meta.head_commit.clone()
-                    } else {
-                        // Parent is not in metadata (e.g. trunk), get its current HEAD from Git
-                        av_repo.find_commit(parent_branch_name)?
-                               .map(|c| c.id().to_string())
-                               .with_context(|| format!("Failed to find current HEAD for parent branch '{}'", parent_branch_name))?
-                    };
+                let actual_parent_head_oid_str = all_branches_meta_mut
+                    .get(parent_branch_name)
+                    .map(|meta| meta.head_commit.clone()) // Parent already synced in this run
+                    .or_else(|| av_repo.find_commit(parent_branch_name).ok().flatten().map(|c| c.id().to_string())) // Parent is a trunk or not in all_branches_meta_mut yet
+                    .with_context(|| format!("Failed to find current HEAD for parent branch '{}'", parent_branch_name))?;
 
-                if branch_to_sync_meta.parent_commit.as_deref() != Some(actual_parent_head_oid_str.as_str()) {
-                    info!("Branch '{}' (current parent OID: {}) needs rebase onto parent '{}' (new parent OID: {}).",
-                          branch_name, branch_to_sync_meta.parent_commit.as_deref().unwrap_or("None"), parent_branch_name, actual_parent_head_oid_str);
+                let old_parent_commit_for_rebase = branch_to_sync_meta.parent_commit.clone()
+                    .with_context(|| format!("Branch '{}' is missing 'parent_commit' in metadata, cannot determine rebase parameters.", branch_name))?;
 
-                    // Simplified rebase attempt (actual git2 rebase is more complex)
-                    // This is a placeholder for a more robust rebase implementation.
-                    // For now, we'll simulate by checking out the branch and assuming user will handle rebase.
-                    // A real implementation would use av_repo.git2_repo.rebase(...) and handle conflicts.
-                    warn!("Automatic rebase for '{}' is not fully implemented. Please ensure it's correctly rebased onto '{}' at {}.",
-                          branch_name, parent_branch_name, actual_parent_head_oid_str);
-                    warn!("Run: git rebase --onto {} {}", actual_parent_head_oid_str, parent_branch_name);
+                if old_parent_commit_for_rebase != actual_parent_head_oid_str {
+                    info!("Branch '{}' needs rebase. Recorded parent commit: {}, actual parent commit: {}.",
+                          branch_name, old_parent_commit_for_rebase, actual_parent_head_oid_str);
 
+                    // Ensure the branch to be rebased is checked out
+                    if av_repo.current_branch_name().as_deref() != Some(branch_name.as_str()) {
+                        info!("Checking out branch '{}' to prepare for rebase.", branch_name);
+                        av_repo.checkout_branch(branch_name, false, None)
+                            .with_context(|| format!("Failed to checkout branch '{}' for rebase", branch_name))?;
+                    }
 
-                    // After a successful rebase, update metadata:
-                    // For this simplified version, we assume rebase would succeed and update parent_commit.
-                    // The head_commit would also change, but we'd need to get it from the repo post-rebase.
-                    // This is a complex step not fully implemented here.
-                    // For now, we will just update the parent commit in metadata to reflect the desired state.
-                    // The user has to perform the actual rebase.
-                    branch_to_sync_meta.parent_commit = Some(actual_parent_head_oid_str.clone());
-                    // branch_to_sync_meta.head_commit = new_head_oid_after_rebase; // This would be set after successful rebase
-                    was_rebased = true; // Assume rebase was "done" for push logic
-                    statuses.push("Rebased (manual action required)".to_string());
+                    // The third argument to rebase_onto is the branch that is being rebased (current HEAD)
+                    match av_repo.rebase_onto(&actual_parent_head_oid_str, &old_parent_commit_for_rebase, branch_name) {
+                        Ok(_) => {
+                            info!("Branch '{}' rebased successfully onto parent '{}' (at {}).",
+                                  branch_name, parent_branch_name, actual_parent_head_oid_str);
+
+                            let new_head_commit = av_repo.find_commit("HEAD")?
+                                .with_context(|| format!("Failed to get new HEAD commit for '{}' after rebase", branch_name))?;
+                            branch_to_sync_meta.head_commit = new_head_commit.id().to_string();
+                            branch_to_sync_meta.parent_commit = Some(actual_parent_head_oid_str.clone());
+                            was_rebased = true;
+                            statuses.push("Rebased".to_string());
+                        }
+                        Err(e) => {
+                            warn!("Automated rebase failed for branch '{}': {}. Skipping further actions for this branch.", branch_name, e);
+                            // Attempt to restore original branch if it was changed for this rebase
+                            if let Some(orig_b) = &initial_branch_name {
+                                if av_repo.current_branch_name().as_deref() != Some(orig_b.as_str()) {
+                                   if av_repo.checkout_branch(orig_b, false, None).is_err() {
+                                       warn!("Failed to restore original branch '{}' after rebase failure for '{}'.", orig_b, branch_name);
+                                   } else {
+                                       info!("Restored original branch '{}'.", orig_b);
+                                   }
+                                }
+                            }
+                            statuses.push(format!("Rebase failed: {}", e));
+                            println!("  - {}: {}", branch_name, statuses.join(", "));
+                            continue; // Skip push and metadata update for this branch
+                        }
+                    }
                 } else {
                     statuses.push("Parent up-to-date".to_string());
+                }
+            } else {
+                statuses.push("Root branch (no parent to rebase from)".to_string());
                 }
             } else {
                 statuses.push("Root branch (no parent to rebase from)".to_string());

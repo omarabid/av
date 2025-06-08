@@ -3,8 +3,11 @@ use git2::{
     BranchType, CheckoutBuilder, ErrorCode, FetchOptions, ObjectType, Oid, PushOptions, Reference,
     ReferenceType, RemoteCallbacks, Repository as Git2Repository, Revwalk, Status, StatusOptions,
 };
-use log::{debug, warn};
+use log::{debug, warn, error}; // Added error for logging rebase failure
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio}; // For shelling out to git
+// use std::io::{Read, Write}; // Potentially for more control over stdio - not used in this impl
+
 use crate::GLOBAL_CONFIG; // For is_trunk_branch to access additional_trunk_branches
 
 #[derive(Debug)]
@@ -338,5 +341,70 @@ impl AvRepo {
             debug!("Repository is clean.");
         }
         Ok(dirty)
+    }
+
+    pub fn rebase_onto(
+        &self,
+        onto_commit_oid_str: &str,
+        old_base_oid_str: &str,
+        branch_to_rebase_tip_oid_str: &str,
+    ) -> Result<()> {
+        // This function assumes that the branch to rebase (`branch_to_rebase_tip_oid_str`)
+        // is either the current HEAD or a branch name that `git rebase` can check out.
+        // The `git rebase --onto <newbase> <oldbase> <branch>` command itself handles
+        // checking out `<branch>` if it's not the current one.
+        debug!(
+            "Shelling out to git rebase: --onto {} {} {}",
+            onto_commit_oid_str, old_base_oid_str, branch_to_rebase_tip_oid_str
+        );
+
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.workdir); // Ensure git runs in the repo's workdir
+        cmd.arg("rebase")
+            .arg("--onto")
+            .arg(onto_commit_oid_str)
+            .arg(old_base_oid_str)
+            .arg(branch_to_rebase_tip_oid_str); // The branch to be rebased
+
+        // Capture output for better error reporting.
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn git rebase command. Attempted: git rebase --onto {} {} {}",
+                onto_commit_oid_str, old_base_oid_str, branch_to_rebase_tip_oid_str
+            )
+        })?;
+
+        let output = child.wait_with_output().with_context(|| {
+            format!(
+                "Failed to wait for git rebase command completion. Attempted: git rebase --onto {} {} {}",
+                onto_commit_oid_str, old_base_oid_str, branch_to_rebase_tip_oid_str
+            )
+        })?;
+
+        if !output.status.success() {
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            error!(
+                "git rebase command failed.\nCommand: git rebase --onto {} {} {}\nStdout:\n{}\nStderr:\n{}",
+                onto_commit_oid_str, old_base_oid_str, branch_to_rebase_tip_oid_str, stdout_str, stderr_str
+            );
+            // TODO: Differentiate conflict (which might need user action) from other errors.
+            // Common rebase conflict messages include "CONFLICT (content): Merge conflict in <file>"
+            // or "When you have resolved this problem, run \"git rebase --continue\"."
+            // For now, any failure is an error.
+            return Err(anyhow!(
+                "git rebase --onto {} {} {} failed. Stderr: {}",
+                onto_commit_oid_str,
+                old_base_oid_str,
+                branch_to_rebase_tip_oid_str,
+                stderr_str
+            ));
+        }
+
+        debug!("git rebase --onto {} {} {} completed successfully.", onto_commit_oid_str, old_base_oid_str, branch_to_rebase_tip_oid_str);
+        Ok(())
     }
 }
