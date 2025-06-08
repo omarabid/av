@@ -390,13 +390,13 @@ impl GhClient {
         #[derive(Serialize, Default)]
         #[serde(rename_all = "camelCase")]
         struct UpdatePRInputPayload {
-            pull_request_id: String, // Corrected field name to match GQL common practices
+            pull_request_id: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             title: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             body: Option<String>,
-            // #[serde(skip_serializing_if = "Option::is_none")]
-            // base_ref_name: Option<String>, // Corrected field name
+            #[serde(skip_serializing_if = "Option::is_none")]
+            base_ref_name: Option<String>, // Ensure this is active
         }
 
         #[derive(Serialize)]
@@ -439,7 +439,8 @@ impl GhClient {
         };
         if title.is_some() { input_payload.title = title; }
         if body.is_some() { input_payload.body = body; }
-        // if base_ref_name.is_some() { input_payload.base_ref_name = base_ref_name; }
+        if _base_ref_name.is_some() { input_payload.base_ref_name = _base_ref_name; }
+
 
         let gql_payload = GqlMutationPayload {
             query: mutation_str,

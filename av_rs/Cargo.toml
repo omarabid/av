@@ -9,13 +9,24 @@ edition = "2021"
 clap = { version = "4.5.4", features = ["derive"] }
 log = "0.4.21"
 env_logger = "0.11.3"
-reqwest = { version = "0.12.4", features = ["json"] }
+reqwest = { features = ["json"] } # Remove version
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
-tokio = { version = "1.37.0", features = ["full"] }
+tokio = { features = ["full"] } # Remove version
 anyhow = "1.0.86"
 git2 = "0.18.3"
 shellexpand = "3.1.0"
-figment = { version = "0.10.10", features = ["toml", "yaml", "json", "env"] } # Updated to 0.10.10 as 0.10 might be too broad
-xdg = "2.5.2" # Updated to 2.5.2
-once_cell = "1.19.0" # Using a specific recent version
+figment = { features = ["toml", "yaml", "json", "env"] } # Remove version
+xdg = {} # Remove version
+once_cell = "1.19.0"
+# Remove all ICU and low-level pins, let cargo try to resolve.
+# icu_collections = "~1.5.0"
+# icu_properties_data = "~1.5.0"
+# icu_properties = "~1.5.0"
+# icu_normalizer_data = "~1.5.0"
+# icu_provider = "~1.5.0"
+# icu_locid = "~1.5.0"
+# icu_locid_transform = "~1.5.0"
+# tinystr = "0.7.2"
+# writeable = "0.5.1"
+# potential_utf = "0.1.1"

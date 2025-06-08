@@ -345,7 +345,7 @@ async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
         // info!("Synchronizing branch: {}", branch_name); // Moved to be part of the final summary
 
         if opts.rebase {
-        if opts.rebase {
+            // Removed the duplicated/nested `if opts.rebase {` here
             if let Some(parent_branch_name) = &branch_to_sync_meta.parent_branch {
                 let parent_display_name = parent_branch_name.clone(); // For logging
                 let actual_parent_head_oid_str = all_branches_meta_map
@@ -399,9 +399,9 @@ async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
                     final_statuses.push("Parent up-to-date".to_string());
                 }
             } else {
-                final_statuses.push("Root branch".to_string());
+                final_statuses.push("Root branch (no parent to rebase from)".to_string());
             }
-        }
+        } // This now correctly closes the outer `if opts.rebase`
 
         let local_head_for_push_check = &branch_to_sync_meta.head_commit;
         let remote_tracking_ref_for_push = format!("refs/remotes/{}/{}", default_remote, branch_name);
