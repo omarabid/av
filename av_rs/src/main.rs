@@ -18,7 +18,9 @@ pub mod meta;
 use config::{load_config, AvConfig};
 use config::user_state::{load_user_state, UserState};
 use git_ops::AvRepo;
-use crate::commands::branch::BranchOpts; // Added for Commands enum
+use crate::commands::branch::BranchOpts;
+use crate::commands::stack::StackOpts;
+use crate::commands::pr::PrOpts; // Added for Pr command
 
 // Global static variables, initialized in main
 pub static GLOBAL_CONFIG: OnceCell<AvConfig> = OnceCell::new();
@@ -47,6 +49,10 @@ enum Commands {
     Auth {},
     #[clap(about = "Manage stacked branches")]
     Branch(BranchOpts),
+    #[clap(about = "Manage stacks of branches")]
+    Stack(StackOpts),
+    #[clap(about = "Manage pull requests")]
+    Pr(PrOpts),
     #[clap(about = "Print the version information")]
     Version {},
     #[clap(about = "Initialize the repository for Aviator CLI")]
@@ -56,6 +62,9 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Corrected the Commands::Branch match arm from the previous turn.
+    // It should have been `Commands::Branch(opts) => ...`
 
     if cli.debug {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -110,11 +119,14 @@ async fn main() -> anyhow::Result<()> {
             info!("[COMMAND] Auth");
             // TODO: Implement auth command logic
         }
-        Commands::Branch {} => {
-            // This was a placeholder, now replaced by actual command handling
-            // info!("[COMMAND] Branch");
-            // TODO: Implement branch command logic
-            commands::branch::run_branch_cmd(opts).await?
+        Commands::Branch(branch_opts) => { // Correctly use branch_opts
+            commands::branch::run_branch_cmd(branch_opts).await?
+        }
+        Commands::Stack(stack_opts) => { // Correctly use stack_opts
+            commands::stack::run_stack_cmd(stack_opts).await?
+        }
+        Commands::Pr(pr_opts) => { // Add Pr command handling
+            commands::pr::run_pr_cmd(pr_opts).await?
         }
         Commands::Version {} => {
             println!("{}", env!("CARGO_PKG_VERSION"));

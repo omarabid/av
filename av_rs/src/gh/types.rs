@@ -11,3 +11,10 @@ pub struct GhRepositoryDetails {
     pub owner: GhOwner,
     pub name: String,
 }
+
+#[derive(Deserialize, Debug, Clone)] // Only Deserialize needed if it's only for GQL responses
+pub struct PullRequestNode {
+    pub id: String,
+    pub number: i64,
+    pub permalink: String,
+}
