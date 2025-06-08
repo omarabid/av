@@ -20,6 +20,7 @@ pub struct PrOpts {
 pub enum PrCommand {
     Create(PrCreateOpts),
     Update(PrUpdateOpts),
+    Status(PrStatusOpts),
 }
 
 #[derive(Args, Debug)]
@@ -43,12 +44,85 @@ pub struct PrUpdateOpts {
     // For now, it will only update the stack context in the body.
 }
 
+#[derive(Args, Debug)]
+pub struct PrStatusOpts {
+    #[clap(help="PR number to show status for. If not provided, shows status for current branch's PR.")]
+    pub pr_number: Option<i64>,
+    // TODO: --web flag to open in browser
+}
+
 
 pub async fn run_pr_cmd(opts: PrOpts) -> Result<()> {
     match opts.command {
         PrCommand::Create(create_opts) => handle_pr_create(create_opts).await,
         PrCommand::Update(update_opts) => handle_pr_update(update_opts).await,
+        PrCommand::Status(status_opts) => handle_pr_status(status_opts).await,
     }
+}
+
+async fn handle_pr_status(opts: PrStatusOpts) -> Result<()> {
+    let av_repo = GIT_REPO.get().unwrap().as_ref().context("PR status command requires Git repo")?;
+    let config = GLOBAL_CONFIG.get().expect("GLOBAL_CONFIG not initialized");
+    let db = JsonFileDb::new(&av_repo.common_dir);
+
+    let gh_token = config.github.token.as_deref().context("GitHub token not configured")?;
+    let gh_client = GhClient::new(gh_token, config.github.base_url.as_deref())?;
+
+    let repo_meta_from_db = db.read_state()?.repository
+        .with_context(|| "Repository metadata not initialized (run 'av init')")?;
+
+    let target_pr_number: i64;
+    let target_pr_branch_name: String; // Useful for context, even if PR number is given
+
+    if let Some(pr_num) = opts.pr_number {
+        target_pr_number = pr_num;
+        let all_branches = db.get_all_branches()?;
+        target_pr_branch_name = all_branches.values()
+            .find(|bm| bm.pull_request.as_ref().map_or(false, |pr| pr.number == target_pr_number))
+            .map(|bm| bm.name.clone())
+            .unwrap_or_else(|| "unknown (PR number provided directly)".to_string());
+    } else {
+        target_pr_branch_name = av_repo.current_branch_name()?;
+        let branch_meta = db.get_branch(&target_pr_branch_name)?
+            .with_context(|| format!("Current branch '{}' not found in av metadata.", target_pr_branch_name))?;
+        let pr_meta = branch_meta.pull_request
+            .with_context(|| format!("Branch '{}' does not have an associated PR in metadata. Use 'av pr create' or provide a PR number.", target_pr_branch_name))?;
+        target_pr_number = pr_meta.number;
+    }
+
+    info!("Fetching status for PR #{} (branch '{}')...", target_pr_number, target_pr_branch_name);
+
+    let pr_details = gh_client.get_pull_request_details_for_status(&repo_meta_from_db.owner.login, &repo_meta_from_db.name, target_pr_number).await
+        .with_context(|| format!("Failed to fetch details for PR #{}", target_pr_number))?;
+
+    println!("\nPR #{} ({}): {}", pr_details.number, pr_details.id, pr_details.title);
+    println!("  Branch: {} -> {}", pr_details.head_ref_name, pr_details.base_ref_name);
+    println!("  Author: {}", pr_details.author.map_or_else(|| "N/A".to_string(), |a| a.login));
+    println!("  State:  {} (Draft: {})", format!("{:?}", pr_details.state).to_uppercase(), pr_details.is_draft);
+
+    if let Some(decision) = pr_details.review_decision {
+        println!("  Review Decision: {}", format!("{:?}", decision).to_uppercase());
+    } else {
+        println!("  Review Decision: Not available or no reviews yet.");
+    }
+
+    let ci_status_rollup = pr_details.commits.edges.first()
+        .and_then(|edge| edge.node.status_check_rollup.as_ref())
+        .map_or("UNKNOWN".to_string(), |rollup| rollup.state.clone());
+
+    // Colorize CI status (basic example)
+    let ci_status_display = match ci_status_rollup.as_str() {
+        "SUCCESS" => format!("\x1b[32m{}\x1b[0m", ci_status_rollup), // Green
+        "FAILURE" | "ERROR" => format!("\x1b[31m{}\x1b[0m", ci_status_rollup), // Red
+        "PENDING" => format!("\x1b[33m{}\x1b[0m", ci_status_rollup), // Yellow
+        _ => ci_status_rollup, // Default color
+    };
+    println!("  CI Status:     {}", ci_status_display);
+
+    // TODO: List individual check runs for more detail if status_check_rollup is not SUCCESS.
+    // This would involve another GQL query or expanding the current one.
+
+    Ok(())
 }
 
 async fn handle_pr_update(opts: PrUpdateOpts) -> Result<()> {

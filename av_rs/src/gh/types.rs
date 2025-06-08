@@ -54,3 +54,87 @@ pub struct PullRequestDetails {
     // pub title: String, // Not fetching title in this specific struct for now, can be added
     // pub base_ref_name: Option<String>, // Also can be added if needed
 }
+
+
+// Types for PR Status Details
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GhAuthor {
+    pub login: String,
+}
+
+// This was defined in the prompt but not used in the GhPullRequestDetailsForStatus struct directly.
+// Individual contexts might be useful for a more detailed CI status breakdown later.
+// #[derive(Deserialize, Debug, Clone)]
+// #[serde(rename_all = "camelCase")]
+// pub struct GhCommitStatusContext {
+//     pub context: String,
+//     pub state: String, // Note: This 'state' is for a specific check, not the overall rollup
+//     pub target_url: Option<String>,
+// }
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")] // GitHub's StatusState enum (SUCCESS, PENDING, FAILURE, ERROR)
+pub struct GhStatusCheckRollupNode {
+    pub state: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GhCommitNode {
+    pub oid: String,
+    pub status_check_rollup: Option<GhStatusCheckRollupNode>,
+}
+
+// GQL `commits(last:1){edges{node{commit}}}` returns a list of edges, even for `last:1`.
+// The prompt used GhCommitEdge { node: GhCommitNode }, but GQL for `commits.nodes.commit` is more direct.
+// Let's adjust to match the more direct `commits { nodes { commit } }` structure for simplicity.
+// GQL: headRevision { oid } or commits(last:1) { nodes { oid statusCheckRollup { state } } }
+// The prompt's GQL for `GhPullRequestDetailsForStatus` used `commits(last:1) { edges { node { oid ... } } }`
+// So, GhCommitEdge and GhCommitHistory are correct based on that GQL.
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GhCommitEdge {
+    pub node: GhCommitNode, // This node is the commit itself.
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GhCommitHistory {
+    // If using `nodes` directly from commits: `pub nodes: Vec<GhCommitNode>`
+    // If using `edges { node { ... } }`:
+    pub edges: Vec<GhCommitEdge>,
+}
+
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GhReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+    Unknown, // Fallback
+}
+
+impl Default for GhReviewDecision {
+    fn default() -> Self {
+        GhReviewDecision::Unknown
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GhPullRequestDetailsForStatus {
+    pub id: String,
+    pub number: i64,
+    pub title: String,
+    pub author: Option<GhAuthor>, // Author can be null if user deleted account
+    pub state: PullRequestState, // Reuses the existing PullRequestState enum
+    pub is_draft: bool,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+    #[serde(default)] // reviewDecision can be null (e.g. no reviews yet)
+    pub review_decision: Option<GhReviewDecision>,
+    pub commits: GhCommitHistory, // For `commits(last: 1) { edges { node { ... } } }`
+}
