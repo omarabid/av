@@ -8,8 +8,7 @@ use crate::git_ops::AvRepo;
 use crate::meta::{JsonFileDb, BranchMeta, PullRequestMeta};
 use crate::gh::GhClient;
 use crate::{GIT_REPO, GLOBAL_CONFIG};
-// If get_current_stack_branches is moved to a shared location or if stack.rs is a public module
-// use crate::commands::stack::get_current_stack_branches; // Or its new path
+use crate::utils::stack_utils; // Use the new path
 
 #[derive(Parser, Debug)]
 pub struct PrOpts {
@@ -106,11 +105,22 @@ async fn handle_pr_update(opts: PrUpdateOpts) -> Result<()> {
     // let current_stack_branch_names = crate::commands::stack::get_current_stack_branches(&target_pr_branch_name, &all_branches_from_db, av_repo, config)?;
     // let stack_branch_metas_for_action: Vec<&BranchMeta> = all_branches_from_db.values()
     //      .filter(|bm| current_stack_branch_names.contains(&bm.name)).collect();
-    // For this subtask, let's assume an empty stack for now to avoid cross-module dependency issues with get_current_stack_branches.
-    // This means the PR body will say "This PR is not part of a stack." or similar.
-    // The proper fix is to move get_current_stack_branches.
-    warn!("Stack context for PR body update is currently simplified (shows no stack). Refactor needed for get_current_stack_branches.");
-    let stack_branch_metas_for_action: Vec<&BranchMeta> = Vec::new();
+    // Identify stack for the target PR's branch
+    let all_branches_from_db: HashMap<String, BranchMeta> = db.get_all_branches()
+        .context("Failed to load all branch metadata for stack context")?;
+
+    let current_stack_branch_names = stack_utils::get_current_stack_branches(
+        &target_pr_branch_name, // The branch for which the PR is being updated
+        &all_branches_from_db,
+        av_repo,
+        config, // Pass the loaded AvConfig
+    ).context("Failed to determine current stack for PR body update")?;
+
+    let mut stack_branch_metas_for_action: Vec<&BranchMeta> = all_branches_from_db.values()
+        .filter(|bm| current_stack_branch_names.contains(&bm.name))
+        .collect();
+    // Sort for consistent order in PR body
+    stack_branch_metas_for_action.sort_by_key(|bm|オールメタデータ内のブランチの順序を決定するためにbm.parent_branch.as_deref().unwrap_or("").to_string() + &bm.name);
 
 
     let action_opts = actions::pr::UpdatePrBodyWithStackOpts {
