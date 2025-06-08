@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
-use git2::Repository;
+// Remove direct git2::Repository import, use AvRepo from GIT_REPO
+// use git2::Repository;
 use log::info;
-// Import GhRepositoryDetails from the new location
 use crate::gh::GhRepositoryDetails;
-// Import GhClient
 use crate::gh::GhClient;
 use serde_json;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
 use tokio;
-// To access GLOBAL_CONFIG
 use crate::GLOBAL_CONFIG;
+use crate::GIT_REPO; // Import the static GIT_REPO
 
 // Removed local GhRepositoryDetails struct definition
 // Removed mock fetch_github_repo_details async function
@@ -51,17 +50,17 @@ pub async fn run(directory: Option<String>) -> anyhow::Result<()> {
 
     info!("[COMMAND] Init - starting initialization...");
 
-    let repo_path = directory.as_deref().unwrap_or(".");
-    let repo = Repository::open(repo_path)
-        .with_context(|| format!("Failed to open git repository at '{}'", repo_path))?;
-    info!("Opened repository at: {:?}", repo.path());
+    // Get the AvRepo instance from the static variable
+    let av_repo = GIT_REPO
+        .get()
+        .expect("GIT_REPO not initialized. This is a bug.")
+        .as_ref()
+        .context("`init` command requires to be run inside a Git repository or for a directory to be specified.")?;
 
-    let origin_remote = repo
-        .find_remote("origin")
-        .context("Failed to find remote 'origin'")?;
-    let origin_url = origin_remote
-        .url()
-        .context("Origin remote URL is not valid UTF-8")?;
+    info!("Operating in repository with workdir: {:?}, .git dir: {:?}", av_repo.workdir, av_repo.common_dir);
+
+    // Use AvRepo to find the remote URL
+    let origin_url = av_repo.find_remote_url("origin")?;
     info!("Found origin remote URL: {}", origin_url);
 
     let (owner, repo_name) = parse_github_slug(origin_url)?;
@@ -79,9 +78,10 @@ pub async fn run(directory: Option<String>) -> anyhow::Result<()> {
     let repo_details = gh_client.get_repository_details(&owner, &repo_name).await?;
     info!("Fetched GitHub repository details: {:?}", repo_details);
 
-    let metadata_dir = repo.path().join("av");
+    // Use common_dir from AvRepo for metadata path
+    let metadata_dir = av_repo.common_dir.join("av");
     create_dir_all(&metadata_dir)
-        .with_context(|| format!("Failed to create .git/av directory at {:?}", metadata_dir))?;
+        .with_context(|| format!("Failed to create directory at {:?}", metadata_dir))?;
 
     let metadata_file_path = metadata_dir.join("metadata.json");
     let file = File::create(&metadata_file_path)
