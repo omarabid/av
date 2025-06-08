@@ -43,6 +43,62 @@ pub struct StackSyncOpts {
     pub current_stack: bool,
 }
 
+fn get_current_stack_branches<'a>(
+    current_branch_name: &str,
+    all_meta: &'a HashMap<String, BranchMeta>,
+    av_repo: &AvRepo,
+    config: &crate::config::AvConfig
+) -> Result<HashSet<String>> {
+    let mut current_stack_members = HashSet::new();
+    if !all_meta.contains_key(current_branch_name) {
+        // Current git branch is not an av-tracked branch, so no "current stack" in terms of av metadata
+        debug!("Current branch '{}' is not tracked by av, so no 'current stack' to determine.", current_branch_name);
+        return Ok(current_stack_members);
+    }
+
+    // 1. Find the root of the current stack by traversing upwards
+    let mut current_ancestor_name = current_branch_name.to_string();
+    let mut stack_root_name = current_branch_name.to_string(); // Initialize with current branch
+    let default_remote = config.remote.as_deref().unwrap_or("origin");
+
+    // Traverse upwards to find the ultimate root of this stack
+    // A root is a branch that has no parent in metadata, or its parent is a trunk branch
+    while let Some(meta) = all_meta.get(&current_ancestor_name) {
+        stack_root_name = meta.name.clone(); // Current one being checked is part of the stack path
+        if let Some(parent_name) = &meta.parent_branch {
+            // If parent is also tracked by av and is NOT a trunk branch, continue upwards
+            if all_meta.contains_key(parent_name) && !av_repo.is_trunk_branch(parent_name, default_remote)? {
+                current_ancestor_name = parent_name.clone();
+            } else {
+                // Parent is a trunk or not tracked (effectively a root from av's perspective for this stack)
+                break;
+            }
+        } else {
+            // No parent in metadata, this is a root
+            break;
+        }
+    }
+    debug!("Determined stack root for '{}' is '{}'", current_branch_name, stack_root_name);
+    current_stack_members.insert(stack_root_name.clone());
+
+    // 2. Find all descendants of this root (BFS/DFS)
+    let mut queue = VecDeque::new();
+    queue.push_back(stack_root_name); // Start BFS from the identified stack root
+
+    while let Some(branch_name_to_scan) = queue.pop_front() {
+        // Find all branches in all_meta whose parent_branch is branch_name_to_scan
+        for meta_child in all_meta.values() {
+            if meta_child.parent_branch.as_deref() == Some(branch_name_to_scan.as_str()) {
+                if current_stack_members.insert(meta_child.name.clone()) {
+                    queue.push_back(meta_child.name.clone());
+                }
+            }
+        }
+    }
+    debug!("Current stack for '{}' identified with {} members: {:?}", current_branch_name, current_stack_members.len(), current_stack_members);
+    Ok(current_stack_members)
+}
+
 
 pub async fn run_stack_cmd(opts: StackOpts) -> Result<()> {
     match opts.command {
@@ -73,169 +129,171 @@ async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
         info!("Fetch complete.");
     }
 
-    let initial_branch_name = av_repo.current_branch_name().ok(); // Store initially checked-out branch
+    let initial_branch_name = av_repo.current_branch_name().ok();
 
-    let mut all_branches_meta_mut = db.get_all_branches()
+    let mut all_branches_meta_map = db.get_all_branches()
         .context("Failed to load branch metadata for sync")?;
 
-    if all_branches_meta_mut.is_empty() {
+    if all_branches_meta_map.is_empty() {
         info!("No av-tracked branches to sync.");
         return Ok(());
     }
 
-    let branches_to_sync_ordered = get_branches_in_sync_order(&all_branches_meta_mut);
-    info!("Processing {} branches for sync...", branches_to_sync_ordered.len());
+    let current_git_branch_name = av_repo.current_branch_name()
+        .context("Failed to get current git branch name. Ensure you are on a branch.")?;
 
-    for branch_to_sync_ref in branches_to_sync_ordered {
-        let mut branch_to_sync_meta = branch_to_sync_ref.clone(); // Operate on a clone
+    let branches_to_process_names: HashSet<String>;
+    if opts.current_stack {
+        info!("Syncing current stack (based on current branch '{}')...", current_git_branch_name);
+        branches_to_process_names = get_current_stack_branches(&current_git_branch_name, &all_branches_meta_map, av_repo, config)?;
+        if branches_to_process_names.is_empty() {
+            info!("Current branch '{}' is not part of a known av-tracked stack or no tracked branches in its stack.", current_git_branch_name);
+            return Ok(());
+        }
+        debug!("Will process {} branches in the current stack.", branches_to_process_names.len());
+    } else {
+        info!("Syncing all av-tracked branches...");
+        branches_to_process_names = all_branches_meta_map.keys().cloned().collect();
+    }
+
+    let ordered_branch_meta_refs = get_branches_in_sync_order(&all_branches_meta_map);
+    let mut branches_to_process_ordered: Vec<&BranchMeta> = ordered_branch_meta_refs.into_iter()
+        .filter(|meta| branches_to_process_names.contains(&meta.name))
+        .collect();
+
+    if branches_to_process_ordered.is_empty() && !branches_to_process_names.is_empty() {
+        // This might happen if get_branches_in_sync_order has issues with the filtered set.
+        // Or if current_stack logic results in a set not properly ordered.
+        // As a fallback, use the names directly if ordering failed to produce results for the filtered set.
+        // This part needs careful review based on how get_branches_in_sync_order handles subsets.
+        // For now, let's assume get_branches_in_sync_order gets all, and we filter AFTER.
+        warn!("Sync order did not include some branches selected for processing. This might indicate an issue.");
+    }
+
+
+    info!("Will attempt to sync {} branches in determined order.", branches_to_process_ordered.len());
+
+    for branch_to_sync_ref in branches_to_process_ordered {
+        let mut branch_to_sync_meta = branch_to_sync_ref.clone();
         let branch_name = &branch_to_sync_meta.name;
         let mut was_rebased = false;
-        let mut statuses = Vec::new();
+        let mut final_statuses = Vec::new(); // Use this for the final summary line for the branch
 
-        info!("Synchronizing branch: {}", branch_name);
+        // info!("Synchronizing branch: {}", branch_name); // Moved to be part of the final summary
 
         if opts.rebase {
+        if opts.rebase {
             if let Some(parent_branch_name) = &branch_to_sync_meta.parent_branch {
-                let actual_parent_head_oid_str = all_branches_meta_mut
+                let parent_display_name = parent_branch_name.clone(); // For logging
+                let actual_parent_head_oid_str = all_branches_meta_map
                     .get(parent_branch_name)
-                    .map(|meta| meta.head_commit.clone()) // Parent already synced in this run
-                    .or_else(|| av_repo.find_commit(parent_branch_name).ok().flatten().map(|c| c.id().to_string())) // Parent is a trunk or not in all_branches_meta_mut yet
+                    .map(|meta| meta.head_commit.clone())
+                    .or_else(|| av_repo.find_commit(parent_branch_name).ok().flatten().map(|c| c.id().to_string()))
                     .with_context(|| format!("Failed to find current HEAD for parent branch '{}'", parent_branch_name))?;
 
-                let old_parent_commit_for_rebase = branch_to_sync_meta.parent_commit.clone()
-                    .with_context(|| format!("Branch '{}' is missing 'parent_commit' in metadata, cannot determine rebase parameters.", branch_name))?;
+                let old_parent_commit_for_rebase = branch_to_sync_meta.parent_commit.clone();
+                if old_parent_commit_for_rebase.as_deref() != Some(actual_parent_head_oid_str.as_str()) {
+                    info!("Branch '{}': Checking rebase against parent '{}' (current head: {})...",
+                          branch_name, parent_display_name, actual_parent_head_oid_str);
 
-                if old_parent_commit_for_rebase != actual_parent_head_oid_str {
-                    info!("Branch '{}' needs rebase. Recorded parent commit: {}, actual parent commit: {}.",
-                          branch_name, old_parent_commit_for_rebase, actual_parent_head_oid_str);
+                    let old_base_commit_oid = old_parent_commit_for_rebase
+                        .with_context(|| format!("Branch '{}' is missing 'parent_commit' in metadata, needed for rebase.", branch_name))?;
 
-                    // Ensure the branch to be rebased is checked out
                     if av_repo.current_branch_name().as_deref() != Some(branch_name.as_str()) {
-                        info!("Checking out branch '{}' to prepare for rebase.", branch_name);
-                        av_repo.checkout_branch(branch_name, false, None)
-                            .with_context(|| format!("Failed to checkout branch '{}' for rebase", branch_name))?;
+                        debug!("Branch '{}': Checking out to prepare for rebase.", branch_name);
+                        av_repo.checkout_branch(branch_name, false, None)?;
                     }
 
-                    // The third argument to rebase_onto is the branch that is being rebased (current HEAD)
-                    match av_repo.rebase_onto(&actual_parent_head_oid_str, &old_parent_commit_for_rebase, branch_name) {
+                    match av_repo.rebase_onto(&actual_parent_head_oid_str, &old_base_commit_oid, branch_name) {
                         Ok(_) => {
-                            info!("Branch '{}' rebased successfully onto parent '{}' (at {}).",
-                                  branch_name, parent_branch_name, actual_parent_head_oid_str);
-
-                            let new_head_commit = av_repo.find_commit("HEAD")?
-                                .with_context(|| format!("Failed to get new HEAD commit for '{}' after rebase", branch_name))?;
+                            let new_head_commit = av_repo.find_commit("HEAD")?.context("Failed to get new HEAD commit after rebase")?;
+                            let new_head_short_oid = new_head_commit.id().to_string().chars().take(7).collect::<String>();
+                            info!("Branch '{}': Successfully rebased onto '{}'. New head: {}.",
+                                  branch_name, parent_display_name, new_head_short_oid);
                             branch_to_sync_meta.head_commit = new_head_commit.id().to_string();
                             branch_to_sync_meta.parent_commit = Some(actual_parent_head_oid_str.clone());
                             was_rebased = true;
-                            statuses.push("Rebased".to_string());
+                            final_statuses.push("Rebased".to_string());
                         }
                         Err(e) => {
-                            warn!("Automated rebase failed for branch '{}': {}. Skipping further actions for this branch.", branch_name, e);
-                            // Attempt to restore original branch if it was changed for this rebase
-                            if let Some(orig_b) = &initial_branch_name {
-                                if av_repo.current_branch_name().as_deref() != Some(orig_b.as_str()) {
-                                   if av_repo.checkout_branch(orig_b, false, None).is_err() {
-                                       warn!("Failed to restore original branch '{}' after rebase failure for '{}'.", orig_b, branch_name);
-                                   } else {
-                                       info!("Restored original branch '{}'.", orig_b);
-                                   }
+                            let err_msg = format!("{}", e);
+                            if err_msg.contains("Merge conflict") || err_msg.contains("Resolve all conflicts") || err_msg.contains("applied an RERERE") {
+                                warn!("Branch '{}': Rebase failed due to merge conflicts. Please resolve them and run `git rebase --continue` or `git rebase --abort`. Skipping further actions for this branch.", branch_name);
+                            } else {
+                                warn!("Branch '{}': Automated rebase failed: {}. Skipping further actions for this branch.", branch_name, err_msg);
+                            }
+                            final_statuses.push(format!("Rebase Failed ({})", err_msg.split('\n').next().unwrap_or("unknown error")));
+                             if let Some(orig_b) = &initial_branch_name {
+                                if av_repo.current_branch_name().as_deref().is_ok() && av_repo.current_branch_name().as_deref() != Some(orig_b.as_str()) {
+                                   if av_repo.checkout_branch(orig_b, false, None).is_err() { warn!("Failed to restore original branch '{}'.", orig_b); }
                                 }
                             }
-                            statuses.push(format!("Rebase failed: {}", e));
-                            println!("  - {}: {}", branch_name, statuses.join(", "));
-                            continue; // Skip push and metadata update for this branch
+                            println!("  - {}: {}", branch_name, final_statuses.join(", "));
+                            continue;
                         }
                     }
                 } else {
-                    statuses.push("Parent up-to-date".to_string());
+                    final_statuses.push("Parent up-to-date".to_string());
                 }
             } else {
-                statuses.push("Root branch (no parent to rebase from)".to_string());
-                }
-            } else {
-                statuses.push("Root branch (no parent to rebase from)".to_string());
+                final_statuses.push("Root branch".to_string());
             }
         }
 
-        // **Push Logic (if opts.push)**
-        let local_head_oid_str = &branch_to_sync_meta.head_commit; // Use metadata's head for consistency before rebase
-        let remote_tracking_ref = format!("refs/remotes/{}/{}", default_remote, branch_name);
-        let remote_branch_commit = av_repo.find_commit(&remote_tracking_ref)?;
+        let local_head_for_push_check = &branch_to_sync_meta.head_commit;
+        let remote_tracking_ref_for_push = format!("refs/remotes/{}/{}", default_remote, branch_name);
+        let remote_branch_commit_for_push = av_repo.find_commit(&remote_tracking_ref_for_push)?;
 
-        let needs_push = match (av_repo.find_commit(local_head_oid_str)?, remote_branch_commit) {
+        let needs_push = match (av_repo.find_commit(local_head_for_push_check)?, remote_branch_commit_for_push) {
             (Some(local_commit), Some(remote_commit)) => local_commit.id() != remote_commit.id(),
-            (Some(_), None) => true, // Local exists, remote doesn't
-            _ => false, // Local doesn't exist (shouldn't happen for tracked branch) or other issue
+            (Some(_), None) => true,
+            _ => false,
         };
 
         if opts.push && (needs_push || was_rebased) {
-            let force_push = was_rebased; // Force push if branch was (conceptually) rebased
+            let force_push = was_rebased;
             let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
-            info!("Pushing branch '{}' to remote '{}' (force: {})...", branch_name, default_remote, force_push);
+            info!("Branch '{}': Checking push status to remote '{}' (force: {})...", branch_name, default_remote, force_push);
             match av_repo.push(default_remote, &[&refspec], force_push) {
-                Ok(_) => {
-                    info!("Successfully pushed '{}'.", branch_name);
-                    statuses.push("Pushed".to_string());
-                }
-                Err(e) => {
-                    warn!("Failed to push branch '{}': {}", branch_name, e);
-                    statuses.push(format!("Push failed: {}", e));
-                }
+                Ok(_) => { info!("Branch '{}': Successfully pushed (force: {}).", branch_name, force_push); final_statuses.push("Pushed".to_string()); }
+                Err(e) => { warn!("Branch '{}': Failed to push: {}", branch_name, e); final_statuses.push(format!("Push Failed ({})", e)); }
             }
         } else if opts.push {
-            statuses.push("Push: No changes".to_string());
+            final_statuses.push("Push: No changes".to_string());
         }
 
-
-        // **PR Status Check (Phase 1 logic - can be enhanced)**
         if let Some(pr_meta) = &branch_to_sync_meta.pull_request {
              match gh_client.get_pull_request_status(&repo_meta.owner.login, &repo_meta.name, pr_meta.number).await {
                 Ok(pr_info) => {
-                    statuses.push(format!("PR #{} is {:?} (draft: {})", pr_info.number, pr_info.state, pr_info.is_draft));
+                    final_statuses.push(format!("PR #{} {:?} (draft: {})", pr_info.number, pr_info.state, pr_info.is_draft));
                     if opts.prune_merged && pr_info.state == crate::gh::PullRequestState::Merged {
-                        info!("PR #{} for branch '{}' is merged. Pruning branch...", pr_info.number, branch_name);
-                        // Checkout parent/default if current
-                        let current_branch_name_opt = av_repo.current_branch_name().ok();
-                        if current_branch_name_opt.as_deref() == Some(branch_name.as_str()) {
-                            let parent_to_checkout = branch_to_sync_meta.parent_branch.as_deref()
-                                .or_else(|| av_repo.default_branch_shorthand(default_remote).ok());
-                            if let Some(checkout_target) = parent_to_checkout {
-                                info!("Currently on merged branch '{}', checking out '{}' before pruning.", branch_name, checkout_target);
-                                av_repo.checkout_branch(checkout_target, false, None)?;
-                            } else {
-                                return Err(anyhow!("Cannot prune current merged branch '{}' without a known parent/default to switch to.", branch_name));
-                            }
+                        info!("Branch '{}': PR #{} is MERGED. Pruning...", branch_name, pr_info.number);
+                        if initial_branch_name.as_deref() == Some(branch_name.as_str()) {
+                            let parent_to_checkout = branch_to_sync_meta.parent_branch.as_deref().or_else(|| av_repo.default_branch_shorthand(default_remote).ok());
+                            if let Some(checkout_target) = parent_to_checkout { av_repo.checkout_branch(checkout_target, false, None)?; }
+                            else { return Err(anyhow!("Cannot prune current merged branch '{}'.", branch_name)); }
                         }
-                        // Delete local git branch
                         if av_repo.branch_exists(branch_name, None)? {
-                            match av_repo.git2_repo.find_branch(branch_name, git2::BranchType::Local) {
-                                Ok(mut b) => { b.delete()?; info!("Deleted local git branch '{}'.", branch_name); },
-                                Err(e) if e.code() == git2::ErrorCode::NotFound => {}, // Already deleted
-                                Err(e) => warn!("Failed to delete local git branch '{}': {}", branch_name, e),
-                            }
+                            if let Ok(mut b) = av_repo.git2_repo.find_branch(branch_name, git2::BranchType::Local) { b.delete()?; }
                         }
-                        // TODO: Delete remote git branch (optional, configurable)
                         db.delete_branch(branch_name)?;
-                        all_branches_meta_mut.remove(branch_name); // Remove from our working set
-                        info!("Pruned merged branch '{}' from metadata and locally.", branch_name);
-                        statuses.push("Pruned (merged)".to_string());
-                        println!("  - {}: {}", branch_name, statuses.join(", "));
-                        continue; // Skip further processing for this pruned branch
+                        all_branches_meta_map.remove(branch_name);
+                        final_statuses.push("Pruned (merged)".to_string());
+                        println!("  - {}: {}", branch_name, final_statuses.join(", "));
+                        continue;
                     }
                 }
-                Err(e) => statuses.push(format!("PR #{} status error: {}", pr_meta.number, e)),
+                Err(e) => final_statuses.push(format!("PR #{} status error: {}", pr_meta.number, e)),
             }
         } else {
-            statuses.push("No PR".to_string());
+            final_statuses.push("No PR".to_string());
         }
 
-        // Update metadata in the main map for next iterations if rebase changed parent_commit
-        // And persist the final state of this branch to DB
-        if was_rebased { // Or if any other metadata changed
-            all_branches_meta_mut.insert(branch_name.clone(), branch_to_sync_meta.clone());
-            db.upsert_branch(&branch_to_sync_meta)?; // Persist change
+        if was_rebased {
+            all_branches_meta_map.insert(branch_name.clone(), branch_to_sync_meta.clone());
+            db.upsert_branch(&branch_to_sync_meta)?;
         }
-        println!("  - {}: {}", branch_name, statuses.join(", "));
+        println!("  - {}: {}", branch_name, final_statuses.join(", "));
     }
     Ok(())
 }
