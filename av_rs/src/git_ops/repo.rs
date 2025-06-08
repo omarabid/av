@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, anyhow};
-use git2::{BranchType, CheckoutBuilder, ErrorCode, ObjectType, Oid, Reference, ReferenceType, Repository as Git2Repository};
+use git2::{
+    BranchType, CheckoutBuilder, ErrorCode, FetchOptions, ObjectType, Oid, PushOptions, Reference,
+    ReferenceType, RemoteCallbacks, Repository as Git2Repository, Revwalk, Status, StatusOptions,
+};
 use log::{debug, warn};
 use std::path::{Path, PathBuf};
 use crate::GLOBAL_CONFIG; // For is_trunk_branch to access additional_trunk_branches
@@ -205,5 +208,135 @@ impl AvRepo {
             }
             Err(e) => Err(e.into()).context(format!("Failed to find merge base for commits '{}' and '{}'", commit_a_str, commit_b_str)),
         }
+    }
+
+    // Remote Operations
+    pub fn fetch(&self, remote_name: &str, refspecs: &[&str], prune: bool) -> Result<()> {
+        let mut remote = self.git2_repo.find_remote(remote_name)
+            .with_context(|| format!("Failed to find remote '{}'", remote_name))?;
+
+        let mut fetch_opts = FetchOptions::new();
+        if prune {
+            fetch_opts.prune(git2::FetchPrune::On);
+        }
+        // TODO: Add remote_callbacks for authentication if needed in the future
+        // let mut callbacks = RemoteCallbacks::new();
+        // callbacks.credentials(|_url, _username_from_url, _allowed_types| {});
+        // fetch_opts.remote_callbacks(callbacks);
+
+        debug!("Fetching from remote '{}' with refspecs: {:?}, prune: {}", remote_name, refspecs, prune);
+        remote.fetch(refspecs, Some(&mut fetch_opts), None) // None for custom fetch message
+            .with_context(|| format!("Failed to fetch from remote '{}'", remote_name))
+    }
+
+    pub fn push(&self, remote_name: &str, refspecs: &[&str], force: bool) -> Result<()> {
+        let mut remote = self.git2_repo.find_remote(remote_name)
+            .with_context(|| format!("Failed to find remote '{}'", remote_name))?;
+
+        let mut push_opts = PushOptions::new();
+        // TODO: Add remote_callbacks for authentication if needed
+        // let mut callbacks = RemoteCallbacks::new();
+        // callbacks.credentials(...);
+        // push_opts.remote_callbacks(callbacks);
+
+        let final_refspecs_owned: Vec<String>;
+        let final_refspecs_borrowed: Vec<&str>;
+
+        if force {
+            final_refspecs_owned = refspecs.iter().map(|s| format!("+{}", s)).collect();
+            final_refspecs_borrowed = final_refspecs_owned.iter().map(AsRef::as_ref).collect();
+            debug!("Force pushing to remote '{}' with refspecs: {:?}", remote_name, final_refspecs_borrowed);
+        } else {
+            final_refspecs_borrowed = refspecs.to_vec(); // Direct conversion if &[&str] is already correct
+            debug!("Pushing to remote '{}' with refspecs: {:?}", remote_name, final_refspecs_borrowed);
+        }
+
+        remote.push(&final_refspecs_borrowed, Some(&mut push_opts))
+            .with_context(|| format!("Failed to push to remote '{}'", remote_name))
+    }
+
+    // Commit/Log Utilities
+    pub fn find_commit(&self, revision_str: &str) -> Result<Option<git2::Commit>> {
+        match self.git2_repo.revparse_single(revision_str) {
+            Ok(obj) => match obj.peel_to_commit() {
+                Ok(commit) => {
+                    debug!("Found commit {} for revision '{}'", commit.id(), revision_str);
+                    Ok(Some(commit))
+                },
+                Err(e) if e.code() == ErrorCode::Peel || e.code() == ErrorCode::InvalidSpec => {
+                    // InvalidSpec can occur if revparse_single gives a non-commit object that cannot be peeled
+                    debug!("Revision '{}' did not peel to a commit or was invalid: {}", revision_str, e.message());
+                    Ok(None)
+                },
+                Err(e) if e.code() == ErrorCode::NotFound => {
+                     debug!("Object for revision '{}' not found after revparse: {}", revision_str, e.message());
+                    Ok(None)
+                },
+                Err(e) => Err(e.into()).context(format!("Error peeling object for revision '{}'", revision_str)),
+            },
+            Err(e) if e.code() == ErrorCode::NotFound || e.code() == ErrorCode::InvalidSpec => {
+                debug!("Revision '{}' not found or invalid spec: {}", revision_str, e.message());
+                Ok(None)
+            },
+            Err(e) => Err(e.into()).context(format!("Error parsing revision '{}'", revision_str)),
+        }
+    }
+
+    pub fn get_commit_message(&self, commit_oid: Oid) -> Result<String> {
+        let commit = self.git2_repo.find_commit(commit_oid)
+            .with_context(|| format!("Failed to find commit with OID '{}'", commit_oid))?;
+        commit.message().context("Commit message is not valid UTF-8").map(String::from)
+    }
+
+    pub fn get_commit_summary(&self, commit_oid: Oid) -> Result<String> {
+        let commit = self.git2_repo.find_commit(commit_oid)
+            .with_context(|| format!("Failed to find commit with OID '{}'", commit_oid))?;
+        commit.summary().context("Commit summary is not valid UTF-8").map(String::from)
+    }
+
+    pub fn list_commits(&self, start_commit_oid: Oid, end_commit_oid: Option<Oid>) -> Result<Vec<Oid>> {
+        let mut revwalk = self.git2_repo.revwalk()
+            .with_context("Failed to create revwalk")?;
+        revwalk.push(start_commit_oid)
+            .with_context(|| format!("Failed to push start_commit_oid '{}' to revwalk", start_commit_oid))?;
+
+        if let Some(end_oid) = end_commit_oid {
+            revwalk.hide(end_oid)
+                .with_context(|| format!("Failed to hide end_commit_oid '{}' from revwalk", end_oid))?;
+        }
+        // Example sorting: Topological, then by time. Reverse to get older commits first.
+        // revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME | git2::Sort::REVERSE)?;
+
+        let mut oids = Vec::new();
+        for oid_result in revwalk {
+            oids.push(oid_result.with_context("Error during revwalk iteration")?);
+        }
+        debug!("Listed {} commits from {} (excluding {} if specified)", oids.len(), start_commit_oid, end_commit_oid.map_or_else(||"None".to_string(), |o|o.to_string()));
+        Ok(oids)
+    }
+
+    // Status Check
+    pub fn is_dirty(&self) -> Result<bool> {
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true) // Check inside untracked directories
+            .include_ignored(false)    // Don't count ignored files as dirty
+            .include_unmodified(false); // Don't need unmodified files
+
+        let statuses = self.git2_repo.statuses(Some(&mut opts))
+            .context("Failed to get repository statuses")?;
+
+        // is_empty means no changes (not dirty). If not empty, it's dirty.
+        let dirty = !statuses.is_empty();
+        if dirty {
+            debug!("Repository is dirty. Status count: {}", statuses.len());
+            // For more detail if needed:
+            // for entry in statuses.iter() {
+            //     debug!("Dirty file: {:?}, status: {:?}", entry.path(), entry.status());
+            // }
+        } else {
+            debug!("Repository is clean.");
+        }
+        Ok(dirty)
     }
 }

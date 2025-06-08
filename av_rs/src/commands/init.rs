@@ -2,14 +2,16 @@ use anyhow::{Context, Result};
 // Remove direct git2::Repository import, use AvRepo from GIT_REPO
 // use git2::Repository;
 use log::info;
-use crate::gh::GhRepositoryDetails;
+use crate::gh::GhRepositoryDetails; // This is effectively RepositoryMeta due to the alias in meta::types
 use crate::gh::GhClient;
-use serde_json;
-use std::fs::{create_dir_all, File};
-use std::io::Write;
+// serde_json, std::fs, std::io::Write are no longer directly needed for metadata writing logic here
+// use serde_json;
+// use std::fs::{create_dir_all, File};
+// use std::io::Write;
 use tokio;
 use crate::GLOBAL_CONFIG;
 use crate::GIT_REPO; // Import the static GIT_REPO
+use crate::meta::{JsonFileDb, MetadataState};
 
 // Removed local GhRepositoryDetails struct definition
 // Removed mock fetch_github_repo_details async function
@@ -78,21 +80,24 @@ pub async fn run(directory: Option<String>) -> anyhow::Result<()> {
     let repo_details = gh_client.get_repository_details(&owner, &repo_name).await?;
     info!("Fetched GitHub repository details: {:?}", repo_details);
 
-    // Use common_dir from AvRepo for metadata path
-    let metadata_dir = av_repo.common_dir.join("av");
-    create_dir_all(&metadata_dir)
-        .with_context(|| format!("Failed to create directory at {:?}", metadata_dir))?;
+    // Initialize JsonFileDb with the repository's common_dir (e.g., .git/)
+    let db = JsonFileDb::new(&av_repo.common_dir);
 
-    let metadata_file_path = metadata_dir.join("metadata.json");
-    let file = File::create(&metadata_file_path)
-        .with_context(|| format!("Failed to create metadata.json file at {:?}", metadata_file_path))?;
+    // Read existing state, or default if none
+    // .unwrap_or_default() is used for simplicity; could also propagate error or handle specifically
+    let mut current_state = db.read_state().unwrap_or_default();
 
-    serde_json::to_writer_pretty(file, &repo_details)
-        .context("Failed to write metadata to JSON file")?;
+    // Set the repository details in the state
+    // repo_details is GhRepositoryDetails, which is type-aliased to RepositoryMeta in meta::types
+    current_state.repository = Some(repo_details.clone());
 
-    info!("Successfully wrote repository metadata to {:?}", metadata_file_path);
+    // Write the updated state back to the JSON file
+    db.write_state(&current_state)
+        .context("Failed to write repository metadata using JsonFileDb")?;
 
-    // TODO: Commit transaction (if using a transactional database)
+    info!("Successfully wrote repository metadata to {:?}", db.metadata_file_path());
+
+    // TODO: Commit transaction (if using a transactional database) - this remains if db operations become more complex
     info!("Successfully initialized repository for use with av!");
     Ok(())
 }
