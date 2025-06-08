@@ -24,7 +24,8 @@ use crate::commands::branch::BranchOpts;
 use crate::commands::stack::StackOpts;
 use crate::commands::pr::PrOpts;
 use crate::commands::commit::CommitOpts;
-use crate::commands::tidy::TidyCliOpts; // Added for Tidy command
+use crate::commands::tidy::TidyCliOpts;
+use crate::commands::next_prev::{NextOpts, PrevOpts}; // Added for Next/Prev commands
 
 // Global static variables, initialized in main
 pub static GLOBAL_CONFIG: OnceCell<AvConfig> = OnceCell::new();
@@ -61,6 +62,10 @@ enum Commands {
     Commit(CommitOpts),
     #[clap(about = "Tidy up merged/closed branches")]
     Tidy(TidyCliOpts),
+    #[clap(alias = "n", about = "Checkout the next branch in the current stack")]
+    Next(NextOpts),
+    #[clap(alias = "p", about = "Checkout the previous branch in the current stack")]
+    Prev(PrevOpts),
     #[clap(about = "Print the version information")]
     Version {},
     #[clap(about = "Initialize the repository for Aviator CLI")]
@@ -139,8 +144,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Commit(commit_opts) => {
             commands::commit::run_commit_cmd(commit_opts).await?
         }
-        Commands::Tidy(tidy_opts) => { // Add Tidy command handling
+        Commands::Tidy(tidy_opts) => {
             commands::tidy::run_tidy_cmd(tidy_opts).await?
+        }
+        Commands::Next(next_opts) => { // Add Next command handling
+            commands::next_prev::run_next_cmd(next_opts).await?
+        }
+        Commands::Prev(prev_opts) => { // Add Prev command handling
+            commands::next_prev::run_prev_cmd(prev_opts).await?
         }
         Commands::Version {} => {
             println!("{}", env!("CARGO_PKG_VERSION"));
