@@ -5,8 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque}; // Added VecDeque for BFS/to
 
 use crate::gh::GhClient;
 use crate::git_ops::AvRepo;
-use crate::meta::{BranchMeta, JsonFileDb};
+use crate::meta::{BranchMeta, JsonFileDb, PullRequestMeta}; // Added PullRequestMeta
 use crate::{GIT_REPO, GLOBAL_CONFIG};
+use log::error; // For logging errors in submit
 
 #[derive(Parser, Debug)]
 pub struct StackOpts {
@@ -20,6 +21,8 @@ pub enum StackCommand {
     Tree(StackTreeOpts),
     /// Synchronize branch status with remote and PRs
     Sync(StackSyncOpts),
+    /// Create or update pull requests for the stack
+    Submit(StackSubmitOpts),
 }
 
 #[derive(Args, Debug)]
@@ -41,6 +44,15 @@ pub struct StackSyncOpts {
     pub prune_merged: bool,
     #[clap(long, default_value_t = false, help = "Only sync the current stack (branches that are ancestors or descendants of the current branch)")]
     pub current_stack: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StackSubmitOpts {
+    #[clap(long, help="Create all PRs as drafts")]
+    pub draft: bool,
+    #[clap(long, help="Only submit PRs for the current branch and its ancestors in the stack")]
+    pub current: bool,
+    // TODO: --no-push? For now, submit always pushes.
 }
 
 fn get_current_stack_branches<'a>(
@@ -104,7 +116,164 @@ pub async fn run_stack_cmd(opts: StackOpts) -> Result<()> {
     match opts.command {
         StackCommand::Tree(tree_opts) => handle_stack_tree(tree_opts).await,
         StackCommand::Sync(sync_opts) => handle_stack_sync(sync_opts).await,
+        StackCommand::Submit(submit_opts) => handle_stack_submit(submit_opts).await,
     }
+}
+
+async fn handle_stack_submit(opts: StackSubmitOpts) -> Result<()> {
+    let av_repo = GIT_REPO.get().unwrap().as_ref()
+        .context("`av stack submit` requires being inside a Git repository.")?;
+    let config = GLOBAL_CONFIG.get().expect("GLOBAL_CONFIG not initialized. This is a bug.");
+    let db = JsonFileDb::new(&av_repo.common_dir);
+    let gh_token = config.github.token.as_deref()
+        .context("GitHub token not configured. Please set AV_GITHUB_TOKEN or GITHUB_TOKEN, or configure in av.toml")?;
+    let gh_client = GhClient::new(gh_token, config.github.base_url.as_deref())?;
+    let repo_info_for_gh = db.read_state()?.repository
+        .with_context(|| "Repository metadata not initialized. Please run `av init` first.")?;
+
+    let mut all_branches_meta_map = db.get_all_branches()
+        .context("Failed to load all branch metadata for submission process")?;
+    let current_git_branch_name = av_repo.current_branch_name()?;
+    let default_remote = config.remote.as_deref().unwrap_or("origin");
+
+    // 1. Determine branches to process
+    let branches_to_consider_names: HashSet<String>;
+    if opts.current {
+        info!("Submitting PRs for current branch '{}' and its ancestors in the stack...", current_git_branch_name);
+        let mut current_stack_ancestors = HashSet::new();
+        let mut q = VecDeque::new();
+
+        if all_branches_meta_map.contains_key(&current_git_branch_name) {
+            q.push_back(current_git_branch_name.clone());
+            current_stack_ancestors.insert(current_git_branch_name.clone());
+        } else {
+            info!("Current branch '{}' is not tracked by av. Cannot determine current stack for submit.", current_git_branch_name);
+            return Ok(());
+        }
+
+        while let Some(branch_name) = q.pop_front() {
+            if let Some(meta) = all_branches_meta_map.get(&branch_name) {
+                if let Some(parent_name) = &meta.parent_branch {
+                    // Only traverse up if parent is tracked and not a trunk
+                    if all_branches_meta_map.contains_key(parent_name) &&
+                       !av_repo.is_trunk_branch(parent_name, default_remote)? &&
+                       current_stack_ancestors.insert(parent_name.clone()) { // cycle guard
+                        q.push_back(parent_name.clone());
+                    }
+                }
+            }
+        }
+        branches_to_consider_names = current_stack_ancestors;
+        if branches_to_consider_names.is_empty() {
+            // This case should ideally be caught by the initial check on current_git_branch_name
+            info!("No trackable stack ancestors found for current branch '{}'.", current_git_branch_name);
+            return Ok(());
+        }
+        debug!("Ancestors for PR submission (current stack): {:?}", branches_to_consider_names);
+    } else {
+        info!("Submitting PRs for all tracked branches in all stacks...");
+        branches_to_consider_names = all_branches_meta_map.keys().cloned().collect();
+    }
+
+    let ordered_branch_meta_refs = get_branches_in_sync_order(&all_branches_meta_map);
+    let branches_to_submit_ordered: Vec<&BranchMeta> = ordered_branch_meta_refs.into_iter()
+        .filter(|meta| branches_to_consider_names.contains(&meta.name))
+        .collect();
+
+    if branches_to_submit_ordered.is_empty() {
+        info!("No branches found to submit based on criteria.");
+        return Ok(());
+    }
+
+    info!("Found {} branches to process for PR submission.", branches_to_submit_ordered.len());
+    let mut pr_creation_errors = Vec::new();
+
+    for branch_meta_ref in branches_to_submit_ordered {
+        let mut branch_meta = branch_meta_ref.clone(); // Clone to modify
+        info!("Processing branch '{}' for PR submission...", branch_meta.name);
+
+        if branch_meta.pull_request.is_some() {
+            info!("Branch '{}' already has PR #{}. Skipping.", branch_meta.name, branch_meta.pull_request.as_ref().unwrap().number);
+            continue;
+        }
+
+        let parent_branch_name_for_pr = match &branch_meta.parent_branch {
+            Some(p_name) => p_name.clone(),
+            None => {
+                // If a root branch in metadata has no parent, its base must be a trunk.
+                // Determine the actual default trunk from the repository.
+                av_repo.default_branch_shorthand(default_remote)
+                    .with_context(|| format!("Branch '{}' has no parent in metadata and failed to get default trunk branch to use as base for PR.", branch_meta.name))?
+            }
+        };
+
+        let title = {
+            let head_oid = av_repo.find_commit(&branch_meta.head_commit)?.context("Cannot find branch head commit OID from metadata")?.id();
+            let parent_for_log_oid = av_repo.find_commit(&parent_branch_name_for_pr)?.context(format!("Cannot find parent branch '{}' head commit OID for log", parent_branch_name_for_pr))?.id();
+
+            if head_oid == parent_for_log_oid {
+                 warn!("Branch '{}' has no new commits compared to its parent '{}'. Using branch name as title.", branch_meta.name, parent_branch_name_for_pr);
+                 branch_meta.name.clone()
+            } else {
+                let commits = av_repo.list_commits(head_oid, Some(parent_for_log_oid))?;
+                if let Some(top_commit_oid) = commits.first() {
+                    av_repo.get_commit_summary(*top_commit_oid)?
+                } else {
+                    debug!("No unique commits found for PR title for branch '{}' (head: {}, parent: {}). Using branch name as title.", branch_meta.name, head_oid, parent_for_log_oid);
+                    branch_meta.name.clone()
+                }
+            }
+        };
+        let body = format!("PR for branch {}.", branch_meta.name); // Simple body for now
+
+        info!("Pushing branch '{}' to remote '{}'...", branch_meta.name, default_remote);
+        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_meta.name, branch_meta.name);
+        if let Err(e) = av_repo.push(default_remote, &[&refspec], false) { // false for no force push here
+            pr_creation_errors.push(format!("Failed to push branch '{}': {}", branch_meta.name, e));
+            error!("Failed to push branch '{}': {}. Skipping PR creation.", branch_meta.name, e);
+            continue;
+        }
+
+        info!("Creating PR for branch '{}': base='{}', title='{}', draft={}", branch_meta.name, parent_branch_name_for_pr, title, opts.draft);
+        match gh_client.create_pull_request(
+            &repo_info_for_gh.id,
+            &parent_branch_name_for_pr,
+            &branch_meta.name,
+            &title,
+            &body,
+            opts.draft
+        ).await {
+            Ok(pr_node) => {
+                info!("Successfully created PR #{} for branch '{}': {}", pr_node.number, branch_meta.name, pr_node.permalink);
+                branch_meta.pull_request = Some(PullRequestMeta { // Use crate::meta::PullRequestMeta
+                    id: pr_node.id, number: pr_node.number, permalink: pr_node.permalink,
+                });
+                if let Err(e) = db.upsert_branch(&branch_meta) {
+                    let err_msg = format!("Failed to update metadata for branch '{}' after PR creation: {}", branch_meta.name, e);
+                    error!("{}", err_msg);
+                    pr_creation_errors.push(err_msg);
+                }
+                // Update the map for subsequent parent/child processing if needed (though submit doesn't have inter-branch dependencies like sync rebase)
+                all_branches_meta_map.insert(branch_meta.name.clone(), branch_meta.clone());
+            }
+            Err(e) => {
+                let err_msg = format!("Failed to create PR for branch '{}': {}", branch_meta.name, e);
+                error!("{}", err_msg);
+                pr_creation_errors.push(err_msg);
+            }
+        }
+    }
+
+    if !pr_creation_errors.is_empty() {
+        error!("Encountered errors during PR submission process:");
+        for err_msg in pr_creation_errors {
+            error!("  - {}", err_msg);
+        }
+        return Err(anyhow!("One or more errors occurred during PR submission. Please check logs."));
+    }
+
+    info!("Stack submit process completed.");
+    Ok(())
 }
 
 async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
