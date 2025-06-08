@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow}; // Added anyhow
 use clap::{Args, Parser, Subcommand};
-use log::info;
-use std::collections::{HashMap, VecDeque, HashSet}; // Added HashSet
+use log::{info, debug}; // Added debug
+use std::collections::{HashMap, HashSet}; // Removed VecDeque as it's not used
 
+use crate::gh::GhClient; // Added GhClient
 use crate::git_ops::AvRepo;
 use crate::meta::{BranchMeta, JsonFileDb};
-use crate::{GIT_REPO, GLOBAL_CONFIG}; // For trunk branches, current branch
+use crate::{GIT_REPO, GLOBAL_CONFIG};
 
 #[derive(Parser, Debug)]
 pub struct StackOpts {
@@ -17,7 +18,8 @@ pub struct StackOpts {
 pub enum StackCommand {
     /// Display the stack tree
     Tree(StackTreeOpts),
-    // TODO: Add other stack subcommands like sync, next, prev, submit
+    /// Synchronize branch status with remote and PRs
+    Sync(StackSyncOpts),
 }
 
 #[derive(Args, Debug)]
@@ -25,10 +27,118 @@ pub struct StackTreeOpts {
     // TODO: Flags like --show-revs, --all
 }
 
+#[derive(Args, Debug)]
+pub struct StackSyncOpts {
+    #[clap(long, help = "Do not fetch from remote before syncing")]
+    pub no_fetch: bool,
+    #[clap(long, help = "Prune remote branches during fetch")]
+    pub prune: bool,
+    // TODO: --current (operate on current stack), --all (operate on all stacks/branches)
+}
+
+
 pub async fn run_stack_cmd(opts: StackOpts) -> Result<()> {
     match opts.command {
         StackCommand::Tree(tree_opts) => handle_stack_tree(tree_opts).await,
+        StackCommand::Sync(sync_opts) => handle_stack_sync(sync_opts).await,
     }
+}
+
+async fn handle_stack_sync(opts: StackSyncOpts) -> Result<()> {
+    let av_repo = GIT_REPO.get().unwrap().as_ref()
+        .context("`av stack sync` requires being inside a Git repository.")?;
+    let config = GLOBAL_CONFIG.get().expect("GLOBAL_CONFIG not initialized. This is a bug.");
+    let db = JsonFileDb::new(&av_repo.common_dir);
+
+    let repo_meta = db.read_state()?.repository
+        .with_context(|| "Repository metadata not found. Please run `av init` first.")?;
+
+    let gh_token = config.github.token.as_deref()
+        .context("GitHub token not configured. Please set AV_GITHUB_TOKEN or GITHUB_TOKEN, or configure in av.toml")?;
+    let gh_client = GhClient::new(gh_token, config.github.base_url.as_deref())?;
+
+    let default_remote = config.remote.as_deref().unwrap_or("origin");
+    if !opts.no_fetch {
+        info!("Fetching from remote '{}' (prune: {})...", default_remote, opts.prune);
+        // For now, fetching all refspecs for the remote. Specific stack refspecs could be an optimization.
+        av_repo.fetch(default_remote, &[], opts.prune)
+            .context(format!("Git fetch from remote '{}' failed", default_remote))?;
+        info!("Fetch complete.");
+    }
+
+    let all_branches_meta = db.get_all_branches()
+        .context("Failed to load branch metadata for sync")?;
+
+    if all_branches_meta.is_empty() {
+        info!("No av-tracked branches to sync.");
+        return Ok(());
+    }
+
+    info!("Sync status for tracked branches:");
+    for branch_meta in all_branches_meta.values().filter(|bm| !bm.name.is_empty()) {
+        let branch_name = &branch_meta.name;
+        let mut statuses = Vec::new();
+
+        // Local vs Remote Git status
+        // Using head_commit from metadata for local OID, as the actual branch might have been modified.
+        let local_branch_oid_from_meta = av_repo.find_commit(&branch_meta.head_commit)?.map(|c| c.id());
+
+        let remote_tracking_ref = format!("refs/remotes/{}/{}", default_remote, branch_name);
+        let remote_branch_oid = av_repo.find_commit(&remote_tracking_ref)?.map(|c| c.id());
+
+        match (local_branch_oid_from_meta, remote_branch_oid) {
+            (Some(local_oid), Some(remote_oid)) => {
+                if local_oid == remote_oid {
+                    statuses.push("Remote: Up-to-date".to_string());
+                } else {
+                    match av_repo.git2_repo.graph_ahead_behind(local_oid, remote_oid) {
+                        Ok((ahead, behind)) if ahead > 0 && behind > 0 => {
+                            statuses.push(format!("Remote: Diverged (ahead {}, behind {})", ahead, behind));
+                        }
+                        Ok((ahead, _)) if ahead > 0 => {
+                            statuses.push(format!("Remote: Ahead by {}", ahead));
+                        }
+                        Ok((_, behind)) if behind > 0 => {
+                            statuses.push(format!("Remote: Behind by {}", behind));
+                        }
+                        Ok((0,0)) => { // Should be caught by local_oid == remote_oid, but graph_ahead_behind might say 0,0
+                             statuses.push("Remote: Up-to-date (graph)".to_string());
+                        }
+                        Err(e) => {
+                            statuses.push(format!("Remote: Error checking sync ({})", e.message()));
+                        }
+                         _ => statuses.push("Remote: Unknown sync status".to_string()), // Should not happen
+                    }
+                }
+            }
+            (Some(_), None) => statuses.push("Remote: Local only (not on remote)".to_string()),
+            (None, Some(_)) => {
+                // This case is unusual if head_commit in meta is valid.
+                // It means the OID stored in meta.head_commit is not found, but remote branch exists.
+                statuses.push(format!("Remote: Exists on remote, but local HEAD {} in metadata not found.", branch_meta.head_commit));
+            }
+            (None, None) => statuses.push("Remote: Not found locally (from meta) or on remote".to_string()),
+        }
+
+        // PR Status
+        if let Some(pr_meta) = &branch_meta.pull_request {
+            match gh_client.get_pull_request_status(&repo_meta.owner.login, &repo_meta.name, pr_meta.number).await {
+                Ok(pr_info) => {
+                    let state_str = format!("{:?}", pr_info.state).to_uppercase();
+                    statuses.push(format!("PR #{}: {} (draft: {})", pr_info.number, state_str, pr_info.is_draft));
+                    // TODO: Potentially update local PR metadata if state changed (e.g., merged/closed)
+                }
+                Err(e) => {
+                    statuses.push(format!("PR #{}: Status error ({})", pr_meta.number, e));
+                    debug!("Error fetching PR #{} status: {:?}", pr_meta.number, e);
+                }
+            }
+        } else {
+            statuses.push("PR: None".to_string());
+        }
+        println!("  - {}: {}", branch_name, statuses.join(", "));
+    }
+    Ok(())
 }
 
 async fn handle_stack_tree(_opts: StackTreeOpts) -> Result<()> {

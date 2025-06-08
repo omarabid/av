@@ -2,9 +2,9 @@ use reqwest::header::{AUTHORIZATION, USER_AGENT, ACCEPT};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use anyhow::{Context, Result, anyhow};
-use log::debug; // Added for logging GQL payload
+use log::debug;
 
-use crate::gh::types::{GhRepositoryDetails, PullRequestNode}; // Added PullRequestNode
+use crate::gh::types::{GhRepositoryDetails, PullRequestNode, PrStatusInfo}; // Added PrStatusInfo
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
@@ -221,5 +221,90 @@ impl GhClient {
         gql_response.data
             .and_then(|d| d.create_pull_request.map(|pr_details| pr_details.pull_request))
             .context("Pull request data not found in GraphQL response after creation")
+    }
+
+    pub async fn get_pull_request_status(
+        &self,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: i64,
+    ) -> Result<PrStatusInfo> {
+        let query_str = "query PullRequestStatus($owner: String!, $name: String!, $prNumber: Int!) {\n  repository(owner: $owner, name: $name) {\n    pullRequest(number: $prNumber) {\n      id\n      number\n      state\n      isDraft\n      headRefName\n      baseRefName\n    }\n  }\n}";
+
+        #[derive(Serialize)]
+        struct GqlVariables<'a> {
+            owner: &'a str,
+            name: &'a str,
+            #[serde(rename = "prNumber")] // Ensure correct serialization for GQL variable name
+            pr_number: i64,
+        }
+
+        #[derive(Serialize)]
+        struct GqlPayload<'a> {
+            query: &'a str,
+            variables: GqlVariables<'a>,
+        }
+
+        // Response structs specific to GetPullRequestStatus
+        #[derive(Deserialize, Debug)]
+        struct GqlResponsePRStatus {
+            data: Option<GqlResponseDataPRStatus>,
+            errors: Option<Vec<GqlError>>, // Re-use GqlError
+        }
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "camelCase")]
+        struct GqlResponseDataPRStatus {
+            repository: Option<GqlResponseRepoPRStatus>,
+        }
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "camelCase")]
+        struct GqlResponseRepoPRStatus {
+            pull_request: Option<PrStatusInfo>,
+        }
+
+        let payload = GqlPayload {
+            query: query_str,
+            variables: GqlVariables {
+                owner: repo_owner,
+                name: repo_name,
+                pr_number: pr_number,
+            },
+        };
+        debug!("Sending GetPullRequestStatus GQL: owner={}, name={}, pr_number={}", repo_owner, repo_name, pr_number);
+
+        let response = self.http_client
+            .post(&self.graphql_url)
+            .header(AUTHORIZATION, format!("bearer {}", self.token))
+            .header(USER_AGENT, APP_USER_AGENT)
+            .header(ACCEPT, "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to send GetPullRequestStatus GQL request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_else(|_| format!("Unknown error, status code {}", status));
+            return Err(anyhow!(
+                "GetPullRequestStatus GQL request failed with status {}: {}",
+                status, error_body
+            ));
+        }
+
+        let gql_response: GqlResponsePRStatus = response.json().await
+            .context("Failed to deserialize GetPullRequestStatus GQL response")?;
+
+        if let Some(errors) = gql_response.errors {
+            if !errors.is_empty() {
+                let error_messages: Vec<String> = errors.into_iter().map(|e| e.message).collect();
+                return Err(anyhow!("GraphQL error fetching PR status: {}", error_messages.join(", ")));
+            }
+        }
+
+        gql_response.data
+            .and_then(|d| d.repository.and_then(|r| r.pull_request))
+            .with_context(|| format!("PR #{} not found or data missing in GQL response for status", pr_number))
     }
 }

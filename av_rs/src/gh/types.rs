@@ -18,3 +18,30 @@ pub struct PullRequestNode {
     pub number: i64,
     pub permalink: String,
 }
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)] // Added PartialEq, Eq for potential comparisons
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")] // Assuming GQL returns MERGED, OPEN, CLOSED
+pub enum PullRequestState {
+    Merged,
+    Open,
+    Closed,
+    Unknown, // Fallback for any other state not explicitly handled
+}
+
+impl Default for PullRequestState {
+    fn default() -> Self {
+        PullRequestState::Unknown
+    }
+}
+
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PrStatusInfo {
+    pub id: String,
+    pub number: i64,
+    pub state: PullRequestState,
+    pub is_draft: bool,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+}
