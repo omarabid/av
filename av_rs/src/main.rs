@@ -22,7 +22,8 @@ use git_ops::AvRepo;
 use crate::commands::branch::BranchOpts;
 use crate::commands::stack::StackOpts;
 use crate::commands::pr::PrOpts;
-use crate::commands::commit::CommitOpts; // Added for Commit command
+use crate::commands::commit::CommitOpts;
+use crate::commands::tidy::TidyCliOpts; // Added for Tidy command
 
 // Global static variables, initialized in main
 pub static GLOBAL_CONFIG: OnceCell<AvConfig> = OnceCell::new();
@@ -57,6 +58,8 @@ enum Commands {
     Pr(PrOpts),
     #[clap(about = "Record changes and update av metadata")]
     Commit(CommitOpts),
+    #[clap(about = "Tidy up merged/closed branches")]
+    Tidy(TidyCliOpts),
     #[clap(about = "Print the version information")]
     Version {},
     #[clap(about = "Initialize the repository for Aviator CLI")]
@@ -132,8 +135,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Pr(pr_opts) => {
             commands::pr::run_pr_cmd(pr_opts).await?
         }
-        Commands::Commit(commit_opts) => { // Add Commit command handling
+        Commands::Commit(commit_opts) => {
             commands::commit::run_commit_cmd(commit_opts).await?
+        }
+        Commands::Tidy(tidy_opts) => { // Add Tidy command handling
+            commands::tidy::run_tidy_cmd(tidy_opts).await?
         }
         Commands::Version {} => {
             println!("{}", env!("CARGO_PKG_VERSION"));

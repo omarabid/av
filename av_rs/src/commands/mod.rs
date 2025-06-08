@@ -3,3 +3,4 @@ pub mod branch;
 pub mod stack;
 pub mod pr;
 pub mod commit;
+pub mod tidy;
